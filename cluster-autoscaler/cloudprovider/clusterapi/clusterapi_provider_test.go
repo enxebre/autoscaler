@@ -1,12 +1,11 @@
+// +build !linux
+
 /*
 Copyright 2019 The Kubernetes Authors.
-
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
-
     http://www.apache.org/licenses/LICENSE-2.0
-
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -21,7 +20,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1"
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
 )
 
@@ -94,13 +93,5 @@ func TestProviderConstructorProperties(t *testing.T) {
 
 	if ng != nil {
 		t.Fatalf("unexpected nodegroup: %v", ng.Id())
-	}
-
-	if got := provider.GPULabel(); got != GPULabel {
-		t.Fatalf("expected %q, got %q", GPULabel, got)
-	}
-
-	if got := len(provider.GetAvailableGPUTypes()); got != 0 {
-		t.Fatalf("expected 0 GPU types, got %d", got)
 	}
 }
