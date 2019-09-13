@@ -1,12 +1,9 @@
 /*
 Copyright 2018 The Kubernetes Authors.
-
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
-
     http://www.apache.org/licenses/LICENSE-2.0
-
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -24,19 +21,15 @@ import (
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
 	"k8s.io/autoscaler/cluster-autoscaler/config"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/errors"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog"
-	clusterclientset "sigs.k8s.io/cluster-api/pkg/client/clientset_generated/clientset"
 )
 
 const (
 	// ProviderName is the name of cluster-api cloud provider.
 	ProviderName = "clusterapi"
-
-	// GPULabel is the label added to nodes with GPU resource.
-	GPULabel = "cluster-api/accelerator"
 )
 
 var _ cloudprovider.CloudProvider = (*provider)(nil)
@@ -45,14 +38,6 @@ type provider struct {
 	controller      *machineController
 	providerName    string
 	resourceLimiter *cloudprovider.ResourceLimiter
-}
-
-func (p *provider) GPULabel() string {
-	return GPULabel
-}
-
-func (p *provider) GetAvailableGPUTypes() map[string]struct{} {
-	return nil
 }
 
 func (p *provider) Name() string {
@@ -71,7 +56,7 @@ func (p *provider) NodeGroups() []cloudprovider.NodeGroup {
 		return nil
 	}
 	for _, ng := range nodegroups {
-		klog.V(4).Infof("discovered node group: %s", ng.Debug())
+		klog.V(2).Infof("discovered node group: %s", ng.Debug())
 		result = append(result, ng)
 	}
 	return result
@@ -143,27 +128,26 @@ func newProvider(
 	}, nil
 }
 
-// BuildClusterAPI builds CloudProvider implementation for machine api.
-func BuildClusterAPI(opts config.AutoscalingOptions, do cloudprovider.NodeGroupDiscoveryOptions, rl *cloudprovider.ResourceLimiter) cloudprovider.CloudProvider {
-	var err error
-	var config *rest.Config
-
-	config, err = clientcmd.BuildConfigFromFlags("", opts.KubeConfigPath)
+// BuildOpenShiftMachineAPI builds CloudProvider implementation for machine api.
+func BuildOpenShiftMachineAPI(opts config.AutoscalingOptions, do cloudprovider.NodeGroupDiscoveryOptions, rl *cloudprovider.ResourceLimiter) cloudprovider.CloudProvider {
+	externalConfig, err := clientcmd.BuildConfigFromFlags("", opts.KubeConfigPath)
 	if err != nil {
 		klog.Fatalf("cannot build config: %v", err)
 	}
 
-	kubeclient, err := kubernetes.NewForConfig(config)
+	// Grab a dynamic interface that we can create informers from
+	dc, err := dynamic.NewForConfig(externalConfig)
+	if err != nil {
+		klog.Fatalf("could not generate dynamic client for config")
+	}
+
+	kubeclient, err := kubernetes.NewForConfig(externalConfig)
 	if err != nil {
 		klog.Fatalf("create kube clientset failed: %v", err)
 	}
 
-	clusterclient, err := clusterclientset.NewForConfig(config)
-	if err != nil {
-		klog.Fatalf("create cluster clientset failed: %v", err)
-	}
-
-	controller, err := newMachineController(kubeclient, clusterclient)
+	enableMachineDeployments := false
+	controller, err := newMachineController(dc, kubeclient, enableMachineDeployments)
 
 	if err != nil {
 		klog.Fatal(err)

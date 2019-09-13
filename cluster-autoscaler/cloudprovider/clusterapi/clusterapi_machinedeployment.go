@@ -1,12 +1,9 @@
 /*
 Copyright 2018 The Kubernetes Authors.
-
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
-
     http://www.apache.org/licenses/LICENSE-2.0
-
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -19,17 +16,16 @@ package clusterapi
 import (
 	"fmt"
 	"path"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/utils/pointer"
-	"sigs.k8s.io/cluster-api/pkg/apis/cluster/v1alpha1"
-	clusterv1alpha1 "sigs.k8s.io/cluster-api/pkg/client/clientset_generated/clientset/typed/cluster/v1alpha1"
 )
 
 type machineDeploymentScalableResource struct {
-	machineapiClient  clusterv1alpha1.ClusterV1alpha1Interface
 	controller        *machineController
-	machineDeployment *v1alpha1.MachineDeployment
+	machineDeployment *MachineDeployment
 	maxSize           int
 	minSize           int
 }
@@ -59,7 +55,7 @@ func (r machineDeploymentScalableResource) Namespace() string {
 func (r machineDeploymentScalableResource) Nodes() ([]string, error) {
 	result := []string{}
 
-	if err := r.controller.filterAllMachineSets(func(machineSet *v1alpha1.MachineSet) error {
+	if err := r.controller.filterAllMachineSets(func(machineSet *MachineSet) error {
 		if machineSetIsOwnedByMachineDeployment(machineSet, r.machineDeployment) {
 			providerIDs, err := r.controller.machineSetProviderIDs(machineSet)
 			if err != nil {
@@ -80,29 +76,55 @@ func (r machineDeploymentScalableResource) Replicas() int32 {
 }
 
 func (r machineDeploymentScalableResource) SetSize(nreplicas int32) error {
-	machineDeployment, err := r.machineapiClient.MachineDeployments(r.Namespace()).Get(r.Name(), metav1.GetOptions{})
+	u, err := r.controller.dynamicclient.Resource(*r.controller.machineDeploymentResource).Namespace(r.machineDeployment.Namespace).Get(r.machineDeployment.Name, metav1.GetOptions{})
+
 	if err != nil {
-		return fmt.Errorf("unable to get MachineDeployment %q: %v", r.ID(), err)
+		return err
 	}
 
-	machineDeployment = machineDeployment.DeepCopy()
-	machineDeployment.Spec.Replicas = &nreplicas
-
-	_, err = r.machineapiClient.MachineDeployments(r.Namespace()).Update(machineDeployment)
-	if err != nil {
-		return fmt.Errorf("unable to update number of replicas of machineDeployment %q: %v", r.ID(), err)
+	if u == nil {
+		return fmt.Errorf("unknown machineDeployment %s", r.machineDeployment.Name)
 	}
-	return nil
+
+	u = u.DeepCopy()
+	if err := unstructured.SetNestedField(u.Object, int64(nreplicas), "spec", "replicas"); err != nil {
+		return fmt.Errorf("failed to set replica value: %v", err)
+	}
+
+	_, updateErr := r.controller.dynamicclient.Resource(*r.controller.machineDeploymentResource).Namespace(u.GetNamespace()).Update(u, metav1.UpdateOptions{})
+	return updateErr
 }
 
-func newMachineDeploymentScalableResource(controller *machineController, machineDeployment *v1alpha1.MachineDeployment) (*machineDeploymentScalableResource, error) {
+func (r machineDeploymentScalableResource) MarkMachineForDeletion(machine *Machine) error {
+	u, err := r.controller.dynamicclient.Resource(*r.controller.machineResource).Namespace(machine.Namespace).Get(machine.Name, metav1.GetOptions{})
+
+	if err != nil {
+		return err
+	}
+	if u == nil {
+		return fmt.Errorf("unknown machine %s", machine.Name)
+	}
+
+	u = u.DeepCopy()
+
+	annotations := u.GetAnnotations()
+	if annotations == nil {
+		annotations = map[string]string{}
+	}
+	annotations[machineDeleteAnnotationKey] = time.Now().String()
+	u.SetAnnotations(annotations)
+
+	_, updateErr := r.controller.dynamicclient.Resource(*r.controller.machineResource).Namespace(u.GetNamespace()).Update(u, metav1.UpdateOptions{})
+	return updateErr
+}
+
+func newMachineDeploymentScalableResource(controller *machineController, machineDeployment *MachineDeployment) (*machineDeploymentScalableResource, error) {
 	minSize, maxSize, err := parseScalingBounds(machineDeployment.Annotations)
 	if err != nil {
 		return nil, fmt.Errorf("error validating min/max annotations: %v", err)
 	}
 
 	return &machineDeploymentScalableResource{
-		machineapiClient:  controller.clusterClientset.ClusterV1alpha1(),
 		controller:        controller,
 		machineDeployment: machineDeployment,
 		maxSize:           maxSize,

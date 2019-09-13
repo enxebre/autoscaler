@@ -1,12 +1,9 @@
 /*
 Copyright 2018 The Kubernetes Authors.
-
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
-
     http://www.apache.org/licenses/LICENSE-2.0
-
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -18,28 +15,19 @@ package clusterapi
 
 import (
 	"fmt"
-	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
-	"k8s.io/klog"
 	schedulernodeinfo "k8s.io/kubernetes/pkg/scheduler/nodeinfo"
-	"sigs.k8s.io/cluster-api/pkg/apis/cluster/v1alpha1"
-	clusterv1alpha1 "sigs.k8s.io/cluster-api/pkg/client/clientset_generated/clientset/typed/cluster/v1alpha1"
 )
 
 const (
-	// TODO(frobware): would prefer to use:
-	//   sigs.k8s.io/cluster-api/pkg/controller/machineset.DeleteNodeAnnotation
-	// but that brings in conflicting dependencies right now.
 	machineDeleteAnnotationKey = "cluster.k8s.io/delete-machine"
-
-	machineAnnotationKey = "cluster.k8s.io/machine"
-	debugFormat          = "%s (min: %d, max: %d, replicas: %d)"
+	machineAnnotationKey       = "cluster.k8s.io/machine"
+	debugFormat                = "%s (min: %d, max: %d, replicas: %d)"
 )
 
 type nodegroup struct {
-	machineapiClient  clusterv1alpha1.ClusterV1alpha1Interface
 	machineController *machineController
 	scalableResource  scalableResource
 }
@@ -138,23 +126,16 @@ func (ng *nodegroup) DeleteNodes(nodes []*corev1.Node) error {
 		if machine.Annotations == nil {
 			machine.Annotations = map[string]string{}
 		}
-
-		machine.Annotations[machineDeleteAnnotationKey] = time.Now().String()
-		machine, err = ng.machineapiClient.Machines(machine.Namespace).Update(machine)
+		nodeGroup, err := ng.machineController.nodeGroupForNode(node)
 		if err != nil {
 			return err
 		}
 
+		if err := nodeGroup.scalableResource.MarkMachineForDeletion(machine); err != nil {
+			return err
+		}
+
 		if err := ng.scalableResource.SetSize(int32(replicas - 1)); err != nil {
-			delete(machine.Annotations, machineDeleteAnnotationKey)
-			// Log errors as warnings from Update()
-			// because no action is taken even if the
-			// annotation persists until the replica count
-			// is modified during a deletion.
-			_, updateErr := ng.machineapiClient.Machines(machine.Namespace).Update(machine)
-			if updateErr != nil {
-				klog.Warningf("failed to delete annotation %q from machine %q: %v", machineDeleteAnnotationKey, machine.Name, updateErr)
-			}
 			return err
 		}
 
@@ -260,25 +241,23 @@ func (ng *nodegroup) Autoprovisioned() bool {
 	return false
 }
 
-func newNodegroupFromMachineSet(controller *machineController, machineSet *v1alpha1.MachineSet) (*nodegroup, error) {
+func newNodegroupFromMachineSet(controller *machineController, machineSet *MachineSet) (*nodegroup, error) {
 	scalableResource, err := newMachineSetScalableResource(controller, machineSet)
 	if err != nil {
 		return nil, err
 	}
 	return &nodegroup{
-		machineapiClient:  controller.clusterClientset.ClusterV1alpha1(),
 		machineController: controller,
 		scalableResource:  scalableResource,
 	}, nil
 }
 
-func newNodegroupFromMachineDeployment(controller *machineController, machineDeployment *v1alpha1.MachineDeployment) (*nodegroup, error) {
+func newNodegroupFromMachineDeployment(controller *machineController, machineDeployment *MachineDeployment) (*nodegroup, error) {
 	scalableResource, err := newMachineDeploymentScalableResource(controller, machineDeployment)
 	if err != nil {
 		return nil, err
 	}
 	return &nodegroup{
-		machineapiClient:  controller.clusterClientset.ClusterV1alpha1(),
 		machineController: controller,
 		scalableResource:  scalableResource,
 	}, nil

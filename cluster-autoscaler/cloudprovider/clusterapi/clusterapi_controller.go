@@ -1,12 +1,9 @@
 /*
 Copyright 2018 The Kubernetes Authors.
-
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
-
     http://www.apache.org/licenses/LICENSE-2.0
-
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -21,21 +18,22 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/dynamic/dynamicinformer"
+	"k8s.io/client-go/informers"
 	kubeinformers "k8s.io/client-go/informers"
 	kubeclient "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog"
 	"k8s.io/utils/pointer"
-	"sigs.k8s.io/cluster-api/pkg/apis/cluster/v1alpha1"
-	clusterclient "sigs.k8s.io/cluster-api/pkg/client/clientset_generated/clientset"
-	clusterinformers "sigs.k8s.io/cluster-api/pkg/client/informers_generated/externalversions"
-	clusterv1alpha1 "sigs.k8s.io/cluster-api/pkg/client/informers_generated/externalversions/cluster/v1alpha1"
 )
 
 const (
-	machineProviderIDIndex = "clusterapi-machineProviderIDIndex"
-	nodeProviderIDIndex    = "clusterapi-nodeProviderIDIndex"
+	machineProviderIDIndex = "machineProviderIDIndex"
+	nodeProviderIDIndex    = "nodeProviderIDIndex"
 )
 
 // machineController watches for Nodes, Machines, MachineSets and
@@ -43,25 +41,36 @@ const (
 // cluster. Additionally, it adds indices to the node informers to
 // satisfy lookup by node.Spec.ProviderID.
 type machineController struct {
-	clusterClientset          clusterclient.Interface
-	clusterInformerFactory    clusterinformers.SharedInformerFactory
 	kubeInformerFactory       kubeinformers.SharedInformerFactory
-	machineDeploymentInformer clusterv1alpha1.MachineDeploymentInformer
-	machineInformer           clusterv1alpha1.MachineInformer
-	machineSetInformer        clusterv1alpha1.MachineSetInformer
+	machineInformerFactory    dynamicinformer.DynamicSharedInformerFactory
+	machineDeploymentInformer informers.GenericInformer
+	machineInformer           informers.GenericInformer
+	machineSetInformer        informers.GenericInformer
 	nodeInformer              cache.SharedIndexInformer
+	enableMachineDeployments  bool
+	dynamicclient             dynamic.Interface
+	machineSetResource        *schema.GroupVersionResource
+	machineResource           *schema.GroupVersionResource
+	machineDeploymentResource *schema.GroupVersionResource
 }
 
-type machineSetFilterFunc func(machineSet *v1alpha1.MachineSet) error
+type machineSetFilterFunc func(machineSet *MachineSet) error
 
 func indexMachineByProviderID(obj interface{}) ([]string, error) {
-	if machine, ok := obj.(*v1alpha1.Machine); ok {
-		if machine.Spec.ProviderID != nil && *machine.Spec.ProviderID != "" {
-			return []string{*machine.Spec.ProviderID}, nil
-		}
-		return []string{}, nil
+	u, ok := obj.(*unstructured.Unstructured)
+	if !ok {
+		return nil, nil
 	}
-	return []string{}, nil
+
+	providerID, found, err := unstructured.NestedString(u.Object, "spec", "providerID")
+	if err != nil || !found {
+		return nil, nil
+	}
+	if providerID == "" {
+		return nil, nil
+	}
+
+	return []string{providerID}, nil
 }
 
 func indexNodeByProviderID(obj interface{}) ([]string, error) {
@@ -74,7 +83,7 @@ func indexNodeByProviderID(obj interface{}) ([]string, error) {
 	return []string{}, nil
 }
 
-func (c *machineController) findMachine(id string) (*v1alpha1.Machine, error) {
+func (c *machineController) findMachine(id string) (*Machine, error) {
 	item, exists, err := c.machineInformer.Informer().GetStore().GetByKey(id)
 	if err != nil {
 		return nil, err
@@ -84,15 +93,20 @@ func (c *machineController) findMachine(id string) (*v1alpha1.Machine, error) {
 		return nil, nil
 	}
 
-	machine, ok := item.(*v1alpha1.Machine)
+	u, ok := item.(*unstructured.Unstructured)
 	if !ok {
-		return nil, fmt.Errorf("internal error; unexpected type %T", machine)
+		return nil, fmt.Errorf("internal error; unexpected type: %T", item)
 	}
 
-	return machine.DeepCopy(), nil
+	machine := newMachineFromUnstructured(u.DeepCopy())
+	if machine == nil {
+		return nil, nil
+	}
+
+	return machine, nil
 }
 
-func (c *machineController) findMachineDeployment(id string) (*v1alpha1.MachineDeployment, error) {
+func (c *machineController) findMachineDeployment(id string) (*MachineDeployment, error) {
 	item, exists, err := c.machineDeploymentInformer.Informer().GetStore().GetByKey(id)
 	if err != nil {
 		return nil, err
@@ -102,18 +116,23 @@ func (c *machineController) findMachineDeployment(id string) (*v1alpha1.MachineD
 		return nil, nil
 	}
 
-	machineDeployment, ok := item.(*v1alpha1.MachineDeployment)
+	u, ok := item.(*unstructured.Unstructured)
 	if !ok {
-		return nil, fmt.Errorf("internal error; unexpected type %T", machineDeployment)
+		return nil, fmt.Errorf("internal error; unexpected type: %T", item)
 	}
 
-	return machineDeployment.DeepCopy(), nil
+	machineDeployment := newMachineDeploymentFromUnstructured(u.DeepCopy())
+	if machineDeployment == nil {
+		return nil, nil
+	}
+
+	return machineDeployment, nil
 }
 
 // findMachineOwner returns the machine set owner for machine, or nil
 // if there is no owner. A DeepCopy() of the object is returned on
 // success.
-func (c *machineController) findMachineOwner(machine *v1alpha1.Machine) (*v1alpha1.MachineSet, error) {
+func (c *machineController) findMachineOwner(machine *Machine) (*MachineSet, error) {
 	machineOwnerRef := machineOwnerRef(machine)
 	if machineOwnerRef == nil {
 		return nil, nil
@@ -128,30 +147,42 @@ func (c *machineController) findMachineOwner(machine *v1alpha1.Machine) (*v1alph
 		return nil, nil
 	}
 
-	machineSet, ok := item.(*v1alpha1.MachineSet)
+	u, ok := item.(*unstructured.Unstructured)
 	if !ok {
-		return nil, fmt.Errorf("internal error; unexpected type: %T", machineSet)
+		return nil, fmt.Errorf("internal error; unexpected type: %T", item)
+	}
+
+	u = u.DeepCopy()
+	machineSet := newMachineSetFromUnstructured(u)
+	if machineSet == nil {
+		return nil, nil
 	}
 
 	if !machineIsOwnedByMachineSet(machine, machineSet) {
 		return nil, nil
 	}
 
-	return machineSet.DeepCopy(), nil
+	return machineSet, nil
 }
 
 // run starts shared informers and waits for the informer cache to
 // synchronize.
 func (c *machineController) run(stopCh <-chan struct{}) error {
 	c.kubeInformerFactory.Start(stopCh)
-	c.clusterInformerFactory.Start(stopCh)
+	c.machineInformerFactory.Start(stopCh)
 
-	klog.V(4).Infof("waiting for caches to sync")
-	if !cache.WaitForCacheSync(stopCh,
+	syncFuncs := []cache.InformerSynced{
 		c.nodeInformer.HasSynced,
 		c.machineInformer.Informer().HasSynced,
 		c.machineSetInformer.Informer().HasSynced,
-		c.machineDeploymentInformer.Informer().HasSynced) {
+	}
+
+	if c.enableMachineDeployments {
+		syncFuncs = append(syncFuncs, c.machineDeploymentInformer.Informer().HasSynced)
+	}
+
+	klog.V(4).Infof("waiting for caches to sync")
+	if !cache.WaitForCacheSync(stopCh, syncFuncs...) {
 		return fmt.Errorf("syncing caches failed")
 	}
 
@@ -160,7 +191,7 @@ func (c *machineController) run(stopCh <-chan struct{}) error {
 
 // findMachineByProviderID finds machine matching providerID. A
 // DeepCopy() of the object is returned on success.
-func (c *machineController) findMachineByProviderID(providerID string) (*v1alpha1.Machine, error) {
+func (c *machineController) findMachineByProviderID(providerID string) (*Machine, error) {
 	objs, err := c.machineInformer.Informer().GetIndexer().ByIndex(machineProviderIDIndex, providerID)
 	if err != nil {
 		return nil, err
@@ -170,12 +201,13 @@ func (c *machineController) findMachineByProviderID(providerID string) (*v1alpha
 	case n > 1:
 		return nil, fmt.Errorf("internal error; expected len==1, got %v", n)
 	case n == 1:
-		machine, ok := objs[0].(*v1alpha1.Machine)
+		u, ok := objs[0].(*unstructured.Unstructured)
 		if !ok {
-			return nil, fmt.Errorf("internal error; unexpected type %T", machine)
+			return nil, fmt.Errorf("internal error; unexpected type %T", objs[0])
 		}
+		machine := newMachineFromUnstructured(u.DeepCopy())
 		if machine != nil {
-			return machine.DeepCopy(), nil
+			return machine, nil
 		}
 	}
 
@@ -209,7 +241,7 @@ func (c *machineController) findNodeByNodeName(name string) (*corev1.Node, error
 
 	node, ok := item.(*corev1.Node)
 	if !ok {
-		return nil, fmt.Errorf("internal error; unexpected type %T", node)
+		return nil, fmt.Errorf("internal error; unexpected type %T", item)
 	}
 
 	return node.DeepCopy(), nil
@@ -218,18 +250,20 @@ func (c *machineController) findNodeByNodeName(name string) (*corev1.Node, error
 // machinesInMachineSet returns all the machines that belong to
 // machineSet. For each machine in the set a DeepCopy() of the object
 // is returned.
-func (c *machineController) machinesInMachineSet(machineSet *v1alpha1.MachineSet) ([]*v1alpha1.Machine, error) {
-	listOptions := labels.SelectorFromSet(labels.Set(machineSet.Labels))
-	machines, err := c.machineInformer.Lister().Machines(machineSet.Namespace).List(listOptions)
+func (c *machineController) machinesInMachineSet(machineSet *MachineSet) ([]*Machine, error) {
+	machines, err := c.listMachines(machineSet.Namespace, labels.SelectorFromSet(machineSet.Labels))
 	if err != nil {
 		return nil, err
 	}
+	if machines == nil {
+		return nil, nil
+	}
 
-	var result []*v1alpha1.Machine
+	var result []*Machine
 
 	for _, machine := range machines {
 		if machineIsOwnedByMachineSet(machine, machineSet) {
-			result = append(result, machine.DeepCopy())
+			result = append(result, machine)
 		}
 	}
 
@@ -240,17 +274,33 @@ func (c *machineController) machinesInMachineSet(machineSet *v1alpha1.MachineSet
 // Machines and MachineSet as they are added, updated and deleted on
 // the cluster.
 func newMachineController(
+	dynamicclient dynamic.Interface,
 	kubeclient kubeclient.Interface,
-	clusterclient clusterclient.Interface,
+	enableMachineDeployments bool,
 ) (*machineController, error) {
 	kubeInformerFactory := kubeinformers.NewSharedInformerFactory(kubeclient, 0)
-	clusterInformerFactory := clusterinformers.NewSharedInformerFactory(clusterclient, 0)
+	informerFactory := dynamicinformer.NewFilteredDynamicSharedInformerFactory(dynamicclient, 0, metav1.NamespaceAll, nil)
 
-	machineInformer := clusterInformerFactory.Cluster().V1alpha1().Machines()
-	machineSetInformer := clusterInformerFactory.Cluster().V1alpha1().MachineSets()
-	machineDeploymentInformer := clusterInformerFactory.Cluster().V1alpha1().MachineDeployments()
+	machineDeploymentResource, _ := schema.ParseResourceArg("machinedeployments.v1alpha2.cluster.x-k8s.io")
 
-	machineDeploymentInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{})
+	machineSetResource, _ := schema.ParseResourceArg("machinesets.v1alpha2.cluster.x-k8s.io")
+	if machineSetResource == nil {
+		panic("MachineSetResource")
+	}
+
+	machineResource, _ := schema.ParseResourceArg("machines.v1alpha2.cluster.x-k8s.io")
+	if machineResource == nil {
+		panic("machineResource")
+	}
+	machineInformer := informerFactory.ForResource(*machineResource)
+	machineSetInformer := informerFactory.ForResource(*machineSetResource)
+	var machineDeploymentInformer informers.GenericInformer
+
+	if enableMachineDeployments && machineDeploymentResource != nil {
+		machineDeploymentInformer = informerFactory.ForResource(*machineDeploymentResource)
+		machineDeploymentInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{})
+	}
+
 	machineInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{})
 	machineSetInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{})
 
@@ -270,17 +320,21 @@ func newMachineController(
 	}
 
 	return &machineController{
-		clusterClientset:          clusterclient,
-		clusterInformerFactory:    clusterInformerFactory,
 		kubeInformerFactory:       kubeInformerFactory,
+		machineInformerFactory:    informerFactory,
 		machineDeploymentInformer: machineDeploymentInformer,
 		machineInformer:           machineInformer,
 		machineSetInformer:        machineSetInformer,
 		nodeInformer:              nodeInformer,
+		enableMachineDeployments:  enableMachineDeployments,
+		dynamicclient:             dynamicclient,
+		machineSetResource:        machineSetResource,
+		machineResource:           machineResource,
+		machineDeploymentResource: machineDeploymentResource,
 	}, nil
 }
 
-func (c *machineController) machineSetNodeNames(machineSet *v1alpha1.MachineSet) ([]string, error) {
+func (c *machineController) machineSetProviderIDs(machineSet *MachineSet) ([]string, error) {
 	machines, err := c.machinesInMachineSet(machineSet)
 	if err != nil {
 		return nil, fmt.Errorf("error listing machines: %v", err)
@@ -326,7 +380,7 @@ func (c *machineController) filterAllMachineSets(f machineSetFilterFunc) error {
 }
 
 func (c *machineController) filterMachineSets(namespace string, f machineSetFilterFunc) error {
-	machineSets, err := c.machineSetInformer.Lister().MachineSets(namespace).List(labels.Everything())
+	machineSets, err := c.listMachineSets(namespace, labels.Everything())
 	if err != nil {
 		return nil
 	}
@@ -341,11 +395,11 @@ func (c *machineController) filterMachineSets(namespace string, f machineSetFilt
 func (c *machineController) machineSetNodeGroups() ([]*nodegroup, error) {
 	var nodegroups []*nodegroup
 
-	if err := c.filterAllMachineSets(func(machineSet *v1alpha1.MachineSet) error {
+	if err := c.filterAllMachineSets(func(machineSet *MachineSet) error {
 		if machineSetHasMachineDeploymentOwnerRef(machineSet) {
 			return nil
 		}
-		ng, err := newNodegroupFromMachineSet(c, machineSet.DeepCopy())
+		ng, err := newNodegroupFromMachineSet(c, machineSet)
 		if err != nil {
 			return err
 		}
@@ -361,7 +415,11 @@ func (c *machineController) machineSetNodeGroups() ([]*nodegroup, error) {
 }
 
 func (c *machineController) machineDeploymentNodeGroups() ([]*nodegroup, error) {
-	machineDeployments, err := c.machineDeploymentInformer.Lister().MachineDeployments(corev1.NamespaceAll).List(labels.Everything())
+	if !c.enableMachineDeployments {
+		return nil, nil
+	}
+
+	machineDeployments, err := c.listMachineDeployments(metav1.NamespaceAll, labels.Everything())
 	if err != nil {
 		return nil, err
 	}
@@ -369,7 +427,7 @@ func (c *machineController) machineDeploymentNodeGroups() ([]*nodegroup, error) 
 	var nodegroups []*nodegroup
 
 	for _, md := range machineDeployments {
-		ng, err := newNodegroupFromMachineDeployment(c, md.DeepCopy())
+		ng, err := newNodegroupFromMachineDeployment(c, md)
 		if err != nil {
 			return nil, err
 		}
@@ -413,26 +471,28 @@ func (c *machineController) nodeGroupForNode(node *corev1.Node) (*nodegroup, err
 		return nil, nil
 	}
 
-	if ref := machineSetMachineDeploymentRef(machineSet); ref != nil {
-		key := fmt.Sprintf("%s/%s", machineSet.Namespace, ref.Name)
-		machineDeployment, err := c.findMachineDeployment(key)
-		if err != nil {
-			return nil, fmt.Errorf("unknown MachineDeployment %q: %v", key, err)
+	if c.enableMachineDeployments {
+		if ref := machineSetMachineDeploymentRef(machineSet); ref != nil {
+			key := fmt.Sprintf("%s/%s", machineSet.Namespace, ref.Name)
+			machineDeployment, err := c.findMachineDeployment(key)
+			if err != nil {
+				return nil, fmt.Errorf("unknown MachineDeployment %q: %v", key, err)
+			}
+			if machineDeployment == nil {
+				return nil, fmt.Errorf("unknown MachineDeployment %q", key)
+			}
+			nodegroup, err := newNodegroupFromMachineDeployment(c, machineDeployment)
+			if err != nil {
+				return nil, fmt.Errorf("failed to build nodegroup for node %q: %v", node.Name, err)
+			}
+			// We don't scale from 0 so nodes must belong
+			// to a nodegroup that has a scale size of at
+			// least 1.
+			if nodegroup.MaxSize()-nodegroup.MinSize() < 1 {
+				return nil, nil
+			}
+			return nodegroup, nil
 		}
-		if machineDeployment == nil {
-			return nil, fmt.Errorf("unknown MachineDeployment %q", key)
-		}
-		nodegroup, err := newNodegroupFromMachineDeployment(c, machineDeployment)
-		if err != nil {
-			return nil, fmt.Errorf("failed to build nodegroup for node %q: %v", node.Name, err)
-		}
-		// We don't scale from 0 so nodes must belong
-		// to a nodegroup that has a scale size of at
-		// least 1.
-		if nodegroup.MaxSize()-nodegroup.MinSize() < 1 {
-			return nil, nil
-		}
-		return nodegroup, nil
 	}
 
 	nodegroup, err := newNodegroupFromMachineSet(c, machineSet)
@@ -468,8 +528,86 @@ func (c *machineController) findNodeByProviderID(providerID string) (*corev1.Nod
 
 	node, ok := objs[0].(*corev1.Node)
 	if !ok {
-		return nil, fmt.Errorf("internal error; unexpected type %T", node)
+		return nil, fmt.Errorf("internal error; unexpected type %T", objs[0])
 	}
 
 	return node.DeepCopy(), nil
+}
+
+func (c *machineController) getMachine(namespace, name string, options metav1.GetOptions) (*Machine, error) {
+	u, err := c.dynamicclient.Resource(*c.machineResource).Namespace(namespace).Get(name, options)
+	if err != nil {
+		return nil, err
+	}
+	return newMachineFromUnstructured(u.DeepCopy()), nil
+}
+
+func (c *machineController) getMachineSet(namespace, name string, options metav1.GetOptions) (*MachineSet, error) {
+	u, err := c.dynamicclient.Resource(*c.machineSetResource).Namespace(namespace).Get(name, options)
+	if err != nil {
+		return nil, err
+	}
+	return newMachineSetFromUnstructured(u.DeepCopy()), nil
+}
+
+func (c *machineController) getMachineDeployment(namespace, name string, options metav1.GetOptions) (*MachineDeployment, error) {
+	u, err := c.dynamicclient.Resource(*c.machineDeploymentResource).Namespace(namespace).Get(name, options)
+	if err != nil {
+		return nil, err
+	}
+	return newMachineDeploymentFromUnstructured(u.DeepCopy()), nil
+}
+
+func (c *machineController) listMachines(namespace string, selector labels.Selector) ([]*Machine, error) {
+	objs, err := c.machineInformer.Lister().ByNamespace(namespace).List(selector)
+	if err != nil {
+		return nil, err
+	}
+
+	var machines []*Machine
+
+	for _, x := range objs {
+		u := x.(*unstructured.Unstructured).DeepCopy()
+		if machine := newMachineFromUnstructured(u); machine != nil {
+			machines = append(machines, machine)
+		}
+	}
+
+	return machines, nil
+}
+
+func (c *machineController) listMachineSets(namespace string, selector labels.Selector) ([]*MachineSet, error) {
+	objs, err := c.machineSetInformer.Lister().ByNamespace(namespace).List(selector)
+	if err != nil {
+		return nil, err
+	}
+
+	var machineSets []*MachineSet
+
+	for _, x := range objs {
+		u := x.(*unstructured.Unstructured).DeepCopy()
+		if machineSet := newMachineSetFromUnstructured(u); machineSet != nil {
+			machineSets = append(machineSets, machineSet)
+		}
+	}
+
+	return machineSets, nil
+}
+
+func (c *machineController) listMachineDeployments(namespace string, selector labels.Selector) ([]*MachineDeployment, error) {
+	objs, err := c.machineDeploymentInformer.Lister().ByNamespace(namespace).List(selector)
+	if err != nil {
+		return nil, err
+	}
+
+	var machineDeployments []*MachineDeployment
+
+	for _, x := range objs {
+		u := x.(*unstructured.Unstructured).DeepCopy()
+		if machineDeployment := newMachineDeploymentFromUnstructured(u); machineDeployment != nil {
+			machineDeployments = append(machineDeployments, machineDeployment)
+		}
+	}
+
+	return machineDeployments, nil
 }

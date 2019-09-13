@@ -1,12 +1,9 @@
 /*
 Copyright 2018 The Kubernetes Authors.
-
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
-
     http://www.apache.org/licenses/LICENSE-2.0
-
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -19,19 +16,18 @@ package clusterapi
 import (
 	"fmt"
 	"path"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/utils/pointer"
-	"sigs.k8s.io/cluster-api/pkg/apis/cluster/v1alpha1"
-	clusterv1alpha1 "sigs.k8s.io/cluster-api/pkg/client/clientset_generated/clientset/typed/cluster/v1alpha1"
 )
 
 type machineSetScalableResource struct {
-	machineapiClient clusterv1alpha1.ClusterV1alpha1Interface
-	controller       *machineController
-	machineSet       *v1alpha1.MachineSet
-	maxSize          int
-	minSize          int
+	controller *machineController
+	machineSet *MachineSet
+	maxSize    int
+	minSize    int
 }
 
 var _ scalableResource = (*machineSetScalableResource)(nil)
@@ -65,32 +61,58 @@ func (r machineSetScalableResource) Replicas() int32 {
 }
 
 func (r machineSetScalableResource) SetSize(nreplicas int32) error {
-	machineSet, err := r.machineapiClient.MachineSets(r.Namespace()).Get(r.Name(), metav1.GetOptions{})
+	u, err := r.controller.dynamicclient.Resource(*r.controller.machineSetResource).Namespace(r.machineSet.Namespace).Get(r.machineSet.Name, metav1.GetOptions{})
+
 	if err != nil {
-		return fmt.Errorf("unable to get MachineSet %q: %v", r.ID(), err)
+		return err
 	}
 
-	machineSet = machineSet.DeepCopy()
-	machineSet.Spec.Replicas = &nreplicas
-
-	_, err = r.machineapiClient.MachineSets(r.Namespace()).Update(machineSet)
-	if err != nil {
-		return fmt.Errorf("unable to update number of replicas of machineset %q: %v", r.ID(), err)
+	if u == nil {
+		return fmt.Errorf("unknown machineSet %s", r.machineSet.Name)
 	}
-	return nil
+
+	u = u.DeepCopy()
+	if err := unstructured.SetNestedField(u.Object, int64(nreplicas), "spec", "replicas"); err != nil {
+		return fmt.Errorf("failed to set replica value: %v", err)
+	}
+
+	_, updateErr := r.controller.dynamicclient.Resource(*r.controller.machineSetResource).Namespace(u.GetNamespace()).Update(u, metav1.UpdateOptions{})
+	return updateErr
 }
 
-func newMachineSetScalableResource(controller *machineController, machineSet *v1alpha1.MachineSet) (*machineSetScalableResource, error) {
+func (r machineSetScalableResource) MarkMachineForDeletion(machine *Machine) error {
+	u, err := r.controller.dynamicclient.Resource(*r.controller.machineResource).Namespace(machine.Namespace).Get(machine.Name, metav1.GetOptions{})
+
+	if err != nil {
+		return err
+	}
+	if u == nil {
+		return fmt.Errorf("unknown machine %s", machine.Name)
+	}
+
+	u = u.DeepCopy()
+
+	annotations := u.GetAnnotations()
+	if annotations == nil {
+		annotations = map[string]string{}
+	}
+	annotations[machineDeleteAnnotationKey] = time.Now().String()
+	u.SetAnnotations(annotations)
+
+	_, updateErr := r.controller.dynamicclient.Resource(*r.controller.machineResource).Namespace(u.GetNamespace()).Update(u, metav1.UpdateOptions{})
+	return updateErr
+}
+
+func newMachineSetScalableResource(controller *machineController, machineSet *MachineSet) (*machineSetScalableResource, error) {
 	minSize, maxSize, err := parseScalingBounds(machineSet.Annotations)
 	if err != nil {
 		return nil, fmt.Errorf("error validating min/max annotations: %v", err)
 	}
 
 	return &machineSetScalableResource{
-		machineapiClient: controller.clusterClientset.ClusterV1alpha1(),
-		controller:       controller,
-		machineSet:       machineSet,
-		maxSize:          maxSize,
-		minSize:          minSize,
+		controller: controller,
+		machineSet: machineSet,
+		maxSize:    maxSize,
+		minSize:    minSize,
 	}, nil
 }
