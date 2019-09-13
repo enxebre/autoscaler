@@ -14,12 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package v1alpha1
+package clusterapi
 
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	"sigs.k8s.io/cluster-api/pkg/apis/cluster/common"
 )
 
 /// [MachineDeploymentSpec]
@@ -77,7 +76,7 @@ type MachineDeploymentStrategy struct {
 	// "RollingUpdate".
 	// Default is RollingUpdate.
 	// +optional
-	Type common.MachineDeploymentStrategyType `json:"type,omitempty"`
+	//Type common.MachineDeploymentStrategyType `json:"type,omitempty"`
 
 	// Rolling update config params. Present only if
 	// MachineDeploymentStrategyType = RollingUpdate.
@@ -167,7 +166,6 @@ type MachineDeploymentStatus struct {
 /// [MachineDeployment]
 // MachineDeployment is the Schema for the machinedeployments API
 // +k8s:openapi-gen=true
-// +kubebuilder:resource:shortName=md
 // +kubebuilder:subresource:status
 // +kubebuilder:subresource:scale:specpath=.spec.replicas,statuspath=.status.replicas,selectorpath=.status.labelSelector
 type MachineDeployment struct {
@@ -189,6 +187,6 @@ type MachineDeploymentList struct {
 	Items           []MachineDeployment `json:"items"`
 }
 
-func init() {
-	SchemeBuilder.Register(&MachineDeployment{}, &MachineDeploymentList{})
-}
+// func init() {
+// 	SchemeBuilder.Register(&MachineDeployment{}, &MachineDeploymentList{})
+// }

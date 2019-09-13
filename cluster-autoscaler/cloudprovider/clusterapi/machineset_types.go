@@ -14,16 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package v1alpha1
+package clusterapi
 
 import (
 	"log"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	metav1validation "k8s.io/apimachinery/pkg/apis/meta/v1/validation"
+
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/validation/field"
-	"sigs.k8s.io/cluster-api/pkg/apis/cluster/common"
 )
 
 // +genclient
@@ -32,7 +32,6 @@ import (
 /// [MachineSet]
 // MachineSet ensures that a specified number of machines replicas are running at any given time.
 // +k8s:openapi-gen=true
-// +kubebuilder:resource:shortName=ms
 // +kubebuilder:subresource:status
 // +kubebuilder:subresource:scale:specpath=.spec.replicas,statuspath=.status.replicas,selectorpath=.status.labelSelector
 type MachineSet struct {
@@ -59,11 +58,6 @@ type MachineSetSpec struct {
 	// +optional
 	MinReadySeconds int32 `json:"minReadySeconds,omitempty"`
 
-	// DeletePolicy defines the policy used to identify nodes to delete when downscaling.
-	// Defaults to "Random".  Valid values are "Random, "Newest", "Oldest"
-	// +kubebuilder:validation:Enum=Random,Newest,Oldest
-	DeletePolicy string `json:"deletePolicy,omitempty"`
-
 	// Selector is a label query over machines that should match the replica count.
 	// Label keys and values that must match in order to be controlled by this MachineSet.
 	// It must match the machine template's labels.
@@ -75,30 +69,6 @@ type MachineSetSpec struct {
 	// +optional
 	Template MachineTemplateSpec `json:"template,omitempty"`
 }
-
-// MachineSetDeletePolicy defines how priority is assigned to nodes to delete when
-// downscaling a MachineSet. Defaults to "Random".
-type MachineSetDeletePolicy string
-
-const (
-	// RandomMachineSetDeletePolicy prioritizes both Machines that have the annotation
-	// "cluster.k8s.io/delete-machine=yes" and Machines that are unhealthy
-	// (Status.ErrorReason or Status.ErrorMessage are set to a non-empty value).
-	// Finally, it picks Machines at random to delete.
-	RandomMachineSetDeletePolicy MachineSetDeletePolicy = "Random"
-
-	// NewestMachineSetDeletePolicy prioritizes both Machines that have the annotation
-	// "cluster.k8s.io/delete-machine=yes" and Machines that are unhealthy
-	// (Status.ErrorReason or Status.ErrorMessage are set to a non-empty value).
-	// It then prioritizes the newest Machines for deletion based on the Machine's CreationTimestamp.
-	NewestMachineSetDeletePolicy MachineSetDeletePolicy = "Newest"
-
-	// OldestMachineSetDeletePolicy prioritizes both Machines that have the annotation
-	// "cluster.k8s.io/delete-machine=yes" and Machines that are unhealthy
-	// (Status.ErrorReason or Status.ErrorMessage are set to a non-empty value).
-	// It then prioritizes the oldest Machines for deletion based on the Machine's CreationTimestamp.
-	OldestMachineSetDeletePolicy MachineSetDeletePolicy = "Oldest"
-)
 
 /// [MachineSetSpec] // doxygen marker
 
@@ -159,7 +129,7 @@ type MachineSetStatus struct {
 	// can be added as events to the MachineSet object and/or logged in the
 	// controller's output.
 	// +optional
-	ErrorReason *common.MachineSetStatusError `json:"errorReason,omitempty"`
+	//ErrorReason *common.MachineSetStatusError `json:"errorReason,omitempty"`
 	// +optional
 	ErrorMessage *string `json:"errorMessage,omitempty"`
 }
@@ -200,12 +170,6 @@ func (m *MachineSet) Default() {
 	if len(m.Namespace) == 0 {
 		m.Namespace = metav1.NamespaceDefault
 	}
-
-	if m.Spec.DeletePolicy == "" {
-		randomPolicy := string(RandomMachineSetDeletePolicy)
-		log.Printf("Defaulting to %s\n", randomPolicy)
-		m.Spec.DeletePolicy = randomPolicy
-	}
 }
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
@@ -217,6 +181,6 @@ type MachineSetList struct {
 	Items           []MachineSet `json:"items"`
 }
 
-func init() {
-	SchemeBuilder.Register(&MachineSet{}, &MachineSetList{})
-}
+// func init() {
+// 	SchemeBuilder.Register(&MachineSet{}, &MachineSetList{})
+// }

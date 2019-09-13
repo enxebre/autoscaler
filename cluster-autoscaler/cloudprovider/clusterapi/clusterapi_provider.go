@@ -129,7 +129,7 @@ func newProvider(
 }
 
 // BuildOpenShiftMachineAPI builds CloudProvider implementation for machine api.
-func BuildOpenShiftMachineAPI(opts config.AutoscalingOptions, do cloudprovider.NodeGroupDiscoveryOptions, rl *cloudprovider.ResourceLimiter) cloudprovider.CloudProvider {
+func BuildClusterAPI(opts config.AutoscalingOptions, do cloudprovider.NodeGroupDiscoveryOptions, rl *cloudprovider.ResourceLimiter) cloudprovider.CloudProvider {
 	externalConfig, err := clientcmd.BuildConfigFromFlags("", opts.KubeConfigPath)
 	if err != nil {
 		klog.Fatalf("cannot build config: %v", err)

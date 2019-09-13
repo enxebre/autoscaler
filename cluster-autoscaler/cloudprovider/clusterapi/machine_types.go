@@ -14,21 +14,24 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package v1alpha1
+package clusterapi
 
 import (
+	"fmt"
+
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"sigs.k8s.io/cluster-api/pkg/apis/cluster/common"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 )
 
 const (
-	// MachineFinalizer is set on PrepareForCreate callback.
-	MachineFinalizer = "machine.cluster.k8s.io"
-
 	// MachineClusterLabelName is the label set on machines linked to a cluster.
 	MachineClusterLabelName = "cluster.k8s.io/cluster-name"
+
+	// MachineClusterIDLabel is the label that a machine must have to identify the
+	// cluster to which it belongs.
+	MachineClusterIDLabel = "machine.openshift.io/cluster-api-cluster"
 )
 
 // +genclient
@@ -37,11 +40,7 @@ const (
 /// [Machine]
 // Machine is the Schema for the machines API
 // +k8s:openapi-gen=true
-// +kubebuilder:resource:shortName=ma
 // +kubebuilder:subresource:status
-// +kubebuilder:printcolumn:name="ProviderID",type="string",JSONPath=".spec.providerID",description="Provider ID"
-// +kubebuilder:printcolumn:name="Phase",type="string",JSONPath=".status.phase",description="Machine status such as Terminating/Pending/Running/Failed etc"
-// +kubebuilder:printcolumn:name="NodeName",type="string",JSONPath=".status.nodeRef.name",description="Node name associated with this machine",priority=1
 type Machine struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
@@ -61,12 +60,9 @@ type MachineSpec struct {
 	// +optional
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	// The list of the taints to be applied to the corresponding Node in additive
-	// manner. This list will not overwrite any other taints added to the Node on
-	// an ongoing basis by other entities. These taints should be actively reconciled
-	// e.g. if you ask the machine controller to apply a taint and then manually remove
-	// the taint the machine controller will put it back) but not have the machine controller
-	// remove any taints
+	// Taints is the full, authoritative list of taints to apply to the corresponding
+	// Node. This list will overwrite any modifications made to the Node on
+	// an ongoing basis.
 	// +optional
 	Taints []corev1.Taint `json:"taints,omitempty"`
 
@@ -74,32 +70,15 @@ type MachineSpec struct {
 	// +optional
 	ProviderSpec ProviderSpec `json:"providerSpec"`
 
-	// Versions of key software to use. This field is optional at cluster
-	// creation time, and omitting the field indicates that the cluster
-	// installation tool should select defaults for the user. These
-	// defaults may differ based on the cluster installer, but the tool
-	// should populate the values it uses when persisting Machine objects.
-	// A Machine spec missing this field at runtime is invalid.
-	// +optional
-	Versions MachineVersionInfo `json:"versions,omitempty"`
-
-	// ConfigSource is used to populate in the associated Node for dynamic kubelet config. This
-	// field already exists in Node, so any updates to it in the Machine
-	// spec will be automatically copied to the linked NodeRef from the
-	// status. The rest of dynamic kubelet config support should then work
-	// as-is.
-	// +optional
-	ConfigSource *corev1.NodeConfigSource `json:"configSource,omitempty"`
-
 	// ProviderID is the identification ID of the machine provided by the provider.
 	// This field must match the provider ID as seen on the node object corresponding to this machine.
 	// This field is required by higher level consumers of cluster-api. Example use case is cluster autoscaler
-	// with cluster-api as provider. Clean-up logic in the autoscaler compares machines to nodes to find out
+	// with cluster-api as provider. Clean-up login in the autoscaler compares machines v/s nodes to find out
 	// machines at provider which could not get registered as Kubernetes nodes. With cluster-api as a
 	// generic out-of-tree provider for autoscaler, this field is required by autoscaler to be
-	// able to have a provider view of the list of machines. Another list of nodes is queried from the k8s apiserver
-	// and then a comparison is done to find out unregistered machines and are marked for delete.
-	// This field will be set by the actuators and consumed by higher level entities like autoscaler that will
+	// able to have a provider view of the list of machines. Another list of nodes is queries from the k8s apiserver
+	// and then comparison is done to find out unregistered machines and are marked for delete.
+	// This field will be set by the actuators and consumed by higher level entities like autoscaler  who will
 	// be interfacing with cluster-api as generic provider.
 	// +optional
 	ProviderID *string `json:"providerID,omitempty"`
@@ -118,22 +97,6 @@ type MachineStatus struct {
 	// +optional
 	LastUpdated *metav1.Time `json:"lastUpdated,omitempty"`
 
-	// Versions specifies the current versions of software on the corresponding Node (if it
-	// exists). This is provided for a few reasons:
-	//
-	// 1) It is more convenient than checking the NodeRef, traversing it to
-	//    the Node, and finding the appropriate field in Node.Status.NodeInfo
-	//    (which uses different field names and formatting).
-	// 2) It removes some of the dependency on the structure of the Node,
-	//    so that if the structure of Node.Status.NodeInfo changes, only
-	//    machine controllers need to be updated, rather than every client
-	//    of the Machines API.
-	// 3) There is no other simple way to check the control plane
-	//    version. A client would have to connect directly to the apiserver
-	//    running on the target node in order to find out its version.
-	// +optional
-	Versions *MachineVersionInfo `json:"versions,omitempty"`
-
 	// ErrorReason will be set in the event that there is a terminal problem
 	// reconciling the Machine and will contain a succinct value suitable
 	// for machine interpretation.
@@ -151,7 +114,7 @@ type MachineStatus struct {
 	// can be added as events to the Machine object and/or logged in the
 	// controller's output.
 	// +optional
-	ErrorReason *common.MachineStatusError `json:"errorReason,omitempty"`
+	//ErrorReason *common.MachineStatusError `json:"errorReason,omitempty"`
 
 	// ErrorMessage will be set in the event that there is a terminal problem
 	// reconciling the Machine and will contain a more verbose string suitable
@@ -183,14 +146,6 @@ type MachineStatus struct {
 	// +optional
 	Addresses []corev1.NodeAddress `json:"addresses,omitempty"`
 
-	// Conditions lists the conditions synced from the node conditions of the corresponding node-object.
-	// Machine-controller is responsible for keeping conditions up-to-date.
-	// MachineSet controller will be taking these conditions as a signal to decide if
-	// machine is healthy or needs to be replaced.
-	// Refer: https://kubernetes.io/docs/concepts/architecture/nodes/#condition
-	// +optional
-	Conditions []corev1.NodeCondition `json:"conditions,omitempty"`
-
 	// LastOperation describes the last-operation performed by the machine-controller.
 	// This API should be useful as a history in terms of the latest operation performed on the
 	// specific machine. It should also convey the state of the latest-operation for example if
@@ -221,21 +176,24 @@ type LastOperation struct {
 	Type *string `json:"type,omitempty"`
 }
 
-/// [MachineStatus]
-
 /// [MachineVersionInfo]
-type MachineVersionInfo struct {
-	// Kubelet is the semantic version of kubelet to run
-	Kubelet string `json:"kubelet"`
 
-	// ControlPlane is the semantic version of the Kubernetes control plane to
-	// run. This should only be populated when the machine is a
-	// control plane.
-	// +optional
-	ControlPlane string `json:"controlPlane,omitempty"`
+func (m *Machine) Validate() field.ErrorList {
+	errors := field.ErrorList{}
+
+	// validate spec.labels
+	fldPath := field.NewPath("spec")
+	if m.Labels[MachineClusterIDLabel] == "" {
+		errors = append(errors, field.Invalid(fldPath.Child("labels"), m.Labels, fmt.Sprintf("missing %v label.", MachineClusterIDLabel)))
+	}
+
+	// validate provider config is set
+	if m.Spec.ProviderSpec.Value == nil {
+		errors = append(errors, field.Invalid(fldPath.Child("spec").Child("providerspec"), m.Spec.ProviderSpec, "value field must be set"))
+	}
+
+	return errors
 }
-
-/// [MachineVersionInfo]
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
@@ -246,6 +204,6 @@ type MachineList struct {
 	Items           []Machine `json:"items"`
 }
 
-func init() {
-	SchemeBuilder.Register(&Machine{}, &MachineList{})
-}
+// func init() {
+// 	SchemeBuilder.Register(&Machine{}, &MachineList{})
+// }
