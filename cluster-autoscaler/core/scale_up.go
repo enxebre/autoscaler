@@ -25,6 +25,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
 	"k8s.io/autoscaler/cluster-autoscaler/clusterstate"
 	"k8s.io/autoscaler/cluster-autoscaler/context"
@@ -48,6 +49,7 @@ type scaleUpResourcesDelta map[string]int64
 const scaleUpLimitUnknown = math.MaxInt64
 
 func computeScaleUpResourcesLeftLimits(
+	cp cloudprovider.CloudProvider,
 	nodeGroups []cloudprovider.NodeGroup,
 	nodeInfos map[string]*schedulernodeinfo.NodeInfo,
 	nodesFromNotAutoscaledGroups []*apiv1.Node,
@@ -57,7 +59,7 @@ func computeScaleUpResourcesLeftLimits(
 	var totalGpus map[string]int64
 	var totalGpusErr error
 	if cloudprovider.ContainsGpuResources(resourceLimiter.GetResources()) {
-		totalGpus, totalGpusErr = calculateScaleUpGpusTotal(nodeGroups, nodeInfos, nodesFromNotAutoscaledGroups)
+		totalGpus, totalGpusErr = calculateScaleUpGpusTotal(cp.GPULabel(), nodeGroups, nodeInfos, nodesFromNotAutoscaledGroups)
 	}
 
 	resultScaleUpLimits := make(scaleUpResourcesLimits)
@@ -134,6 +136,7 @@ func calculateScaleUpCoresMemoryTotal(
 }
 
 func calculateScaleUpGpusTotal(
+	GPULabel string,
 	nodeGroups []cloudprovider.NodeGroup,
 	nodeInfos map[string]*schedulernodeinfo.NodeInfo,
 	nodesFromNotAutoscaledGroups []*apiv1.Node) (map[string]int64, errors.AutoscalerError) {
@@ -149,7 +152,7 @@ func calculateScaleUpGpusTotal(
 			return nil, errors.NewAutoscalerError(errors.CloudProviderError, "No node info for: %s", nodeGroup.Id())
 		}
 		if currentSize > 0 {
-			gpuType, gpuCount, err := gpu.GetNodeTargetGpus(nodeInfo.Node(), nodeGroup)
+			gpuType, gpuCount, err := gpu.GetNodeTargetGpus(GPULabel, nodeInfo.Node(), nodeGroup)
 			if err != nil {
 				return nil, errors.ToAutoscalerError(errors.CloudProviderError, err).AddPrefix("Failed to get target gpu for node group %v:", nodeGroup.Id())
 			}
@@ -161,7 +164,7 @@ func calculateScaleUpGpusTotal(
 	}
 
 	for _, node := range nodesFromNotAutoscaledGroups {
-		gpuType, gpuCount, err := gpu.GetNodeTargetGpus(node, nil)
+		gpuType, gpuCount, err := gpu.GetNodeTargetGpus(GPULabel, node, nil)
 		if err != nil {
 			return nil, errors.ToAutoscalerError(errors.CloudProviderError, err).AddPrefix("Failed to get target gpu for node gpus count for node %v:", node.Name)
 		}
@@ -178,7 +181,7 @@ func computeBelowMax(total int64, max int64) int64 {
 	return 0
 }
 
-func computeScaleUpResourcesDelta(nodeInfo *schedulernodeinfo.NodeInfo, nodeGroup cloudprovider.NodeGroup, resourceLimiter *cloudprovider.ResourceLimiter) (scaleUpResourcesDelta, errors.AutoscalerError) {
+func computeScaleUpResourcesDelta(cp cloudprovider.CloudProvider, nodeInfo *schedulernodeinfo.NodeInfo, nodeGroup cloudprovider.NodeGroup, resourceLimiter *cloudprovider.ResourceLimiter) (scaleUpResourcesDelta, errors.AutoscalerError) {
 	resultScaleUpDelta := make(scaleUpResourcesDelta)
 
 	nodeCPU, nodeMemory := getNodeInfoCoresAndMemory(nodeInfo)
@@ -186,7 +189,7 @@ func computeScaleUpResourcesDelta(nodeInfo *schedulernodeinfo.NodeInfo, nodeGrou
 	resultScaleUpDelta[cloudprovider.ResourceNameMemory] = nodeMemory
 
 	if cloudprovider.ContainsGpuResources(resourceLimiter.GetResources()) {
-		gpuType, gpuCount, err := gpu.GetNodeTargetGpus(nodeInfo.Node(), nodeGroup)
+		gpuType, gpuCount, err := gpu.GetNodeTargetGpus(cp.GPULabel(), nodeInfo.Node(), nodeGroup)
 		if err != nil {
 			return scaleUpResourcesDelta{}, errors.ToAutoscalerError(errors.CloudProviderError, err).AddPrefix("Failed to get target gpu for node group %v:", nodeGroup.Id())
 		}
@@ -244,7 +247,7 @@ var (
 // false if it didn't and error if an error occurred. Assumes that all nodes in the cluster are
 // ready and in sync with instance groups.
 func ScaleUp(context *context.AutoscalingContext, processors *ca_processors.AutoscalingProcessors, clusterStateRegistry *clusterstate.ClusterStateRegistry, unschedulablePods []*apiv1.Pod,
-	nodes []*apiv1.Node, daemonSets []*appsv1.DaemonSet, nodeInfos map[string]*schedulernodeinfo.NodeInfo) (*status.ScaleUpStatus, errors.AutoscalerError) {
+	nodes []*apiv1.Node, daemonSets []*appsv1.DaemonSet, nodeInfos map[string]*schedulernodeinfo.NodeInfo, ignoredTaints taintKeySet) (*status.ScaleUpStatus, errors.AutoscalerError) {
 	// From now on we only care about unschedulable pods that were marked after the newest
 	// node became available for the scheduler.
 	if len(unschedulablePods) == 0 {
@@ -270,6 +273,8 @@ func ScaleUp(context *context.AutoscalingContext, processors *ca_processors.Auto
 	}
 
 	nodeGroups := context.CloudProvider.NodeGroups()
+	gpuLabel := context.CloudProvider.GPULabel()
+	availableGPUTypes := context.CloudProvider.GetAvailableGPUTypes()
 
 	resourceLimiter, errCP := context.CloudProvider.GetResourceLimiter()
 	if errCP != nil {
@@ -278,7 +283,7 @@ func ScaleUp(context *context.AutoscalingContext, processors *ca_processors.Auto
 			errCP)
 	}
 
-	scaleUpResourcesLeft, errLimits := computeScaleUpResourcesLeftLimits(nodeGroups, nodeInfos, nodesFromNotAutoscaledGroups, resourceLimiter)
+	scaleUpResourcesLeft, errLimits := computeScaleUpResourcesLeftLimits(context.CloudProvider, nodeGroups, nodeInfos, nodesFromNotAutoscaledGroups, resourceLimiter)
 	if errLimits != nil {
 		return &status.ScaleUpStatus{Result: status.ScaleUpError}, errLimits.AddPrefix("Could not compute total resources: ")
 	}
@@ -293,7 +298,7 @@ func ScaleUp(context *context.AutoscalingContext, processors *ca_processors.Auto
 				nodeGroup)
 		}
 		for i := 0; i < numberOfNodes; i++ {
-			upcomingNodes = append(upcomingNodes, nodeTemplate)
+			upcomingNodes = append(upcomingNodes, buildNodeInfoForNodeTemplate(nodeTemplate, i))
 		}
 	}
 	klog.V(4).Infof("Upcoming %d nodes", len(upcomingNodes))
@@ -346,7 +351,7 @@ func ScaleUp(context *context.AutoscalingContext, processors *ca_processors.Auto
 			continue
 		}
 
-		scaleUpResourcesDelta, err := computeScaleUpResourcesDelta(nodeInfo, nodeGroup, resourceLimiter)
+		scaleUpResourcesDelta, err := computeScaleUpResourcesDelta(context.CloudProvider, nodeInfo, nodeGroup, resourceLimiter)
 		if err != nil {
 			klog.Errorf("Skipping node group %s; error getting node group resources: %v", nodeGroup.Id(), err)
 			skippedNodeGroups[nodeGroup.Id()] = notReadyReason
@@ -430,7 +435,6 @@ func ScaleUp(context *context.AutoscalingContext, processors *ca_processors.Auto
 		if context.MaxNodesTotal > 0 && len(nodes)+newNodes+len(upcomingNodes) > context.MaxNodesTotal {
 			klog.V(1).Infof("Capping size to max cluster total size (%d)", context.MaxNodesTotal)
 			newNodes = context.MaxNodesTotal - len(nodes) - len(upcomingNodes)
-			context.LogRecorder.Eventf(apiv1.EventTypeWarning, "MaxNodesTotalReached", "Max total nodes in cluster reached: %v", context.MaxNodesTotal)
 			if newNodes < 1 {
 				return &status.ScaleUpStatus{Result: status.ScaleUpError}, errors.NewAutoscalerError(
 					errors.TransientError,
@@ -448,7 +452,7 @@ func ScaleUp(context *context.AutoscalingContext, processors *ca_processors.Auto
 
 			// If possible replace candidate node-info with node info based on crated node group. The latter
 			// one should be more in line with nodes which will be created by node group.
-			mainCreatedNodeInfo, err := getNodeInfoFromTemplate(createNodeGroupResult.MainCreatedNodeGroup, daemonSets, context.PredicateChecker)
+			mainCreatedNodeInfo, err := getNodeInfoFromTemplate(createNodeGroupResult.MainCreatedNodeGroup, daemonSets, context.PredicateChecker, ignoredTaints)
 			if err == nil {
 				nodeInfos[createNodeGroupResult.MainCreatedNodeGroup.Id()] = mainCreatedNodeInfo
 			} else {
@@ -462,7 +466,7 @@ func ScaleUp(context *context.AutoscalingContext, processors *ca_processors.Auto
 			}
 
 			for _, nodeGroup := range createNodeGroupResult.ExtraCreatedNodeGroups {
-				nodeInfo, err := getNodeInfoFromTemplate(nodeGroup, daemonSets, context.PredicateChecker)
+				nodeInfo, err := getNodeInfoFromTemplate(nodeGroup, daemonSets, context.PredicateChecker, ignoredTaints)
 
 				if err != nil {
 					klog.Warningf("Cannot build node info for newly created extra node group %v; balancing similar node groups will not work; err=%v", nodeGroup.Id(), err)
@@ -488,7 +492,7 @@ func ScaleUp(context *context.AutoscalingContext, processors *ca_processors.Auto
 		}
 
 		// apply upper limits for CPU and memory
-		newNodes, err = applyScaleUpResourcesLimits(newNodes, scaleUpResourcesLeft, nodeInfo, bestOption.NodeGroup, resourceLimiter)
+		newNodes, err = applyScaleUpResourcesLimits(context.CloudProvider, newNodes, scaleUpResourcesLeft, nodeInfo, bestOption.NodeGroup, resourceLimiter)
 		if err != nil {
 			return &status.ScaleUpStatus{Result: status.ScaleUpError}, err
 		}
@@ -528,7 +532,7 @@ func ScaleUp(context *context.AutoscalingContext, processors *ca_processors.Auto
 		}
 		klog.V(1).Infof("Final scale-up plan: %v", scaleUpInfos)
 		for _, info := range scaleUpInfos {
-			typedErr := executeScaleUp(context, clusterStateRegistry, info, gpu.GetGpuTypeForMetrics(nodeInfo.Node(), nil), now)
+			typedErr := executeScaleUp(context, clusterStateRegistry, info, gpu.GetGpuTypeForMetrics(gpuLabel, availableGPUTypes, nodeInfo.Node(), nil), now)
 			if typedErr != nil {
 				return &status.ScaleUpStatus{Result: status.ScaleUpError}, typedErr
 			}
@@ -547,6 +551,14 @@ func ScaleUp(context *context.AutoscalingContext, processors *ca_processors.Auto
 	return &status.ScaleUpStatus{Result: status.ScaleUpNoOptionsAvailable, PodsRemainUnschedulable: getRemainingPods(podsRemainUnschedulable, skippedNodeGroups)}, nil
 }
 
+func buildNodeInfoForNodeTemplate(nodeTemplate *schedulernodeinfo.NodeInfo, index int) *schedulernodeinfo.NodeInfo {
+	nodeInfo := nodeTemplate.Clone()
+	node := nodeInfo.Node()
+	node.Name = fmt.Sprintf("%s-%d", node.Name, index)
+	node.UID = uuid.NewUUID()
+	return nodeInfo
+}
+
 type podsPredicatePassingCheckFunctions struct {
 	getPodsPassingPredicates    func(nodeGroupId string) ([]*apiv1.Pod, error)
 	getPodsNotPassingPredicates func(nodeGroupId string) (map[*apiv1.Pod]status.Reasons, error)
@@ -560,6 +572,7 @@ func getPodsPredicatePassingCheckFunctions(
 	podsPassingPredicatesCache := make(map[string][]*apiv1.Pod)
 	podsNotPassingPredicatesCache := make(map[string]map[*apiv1.Pod]status.Reasons)
 	errorsCache := make(map[string]error)
+	checker := newPodsSchedulableOnNodeChecker(context, unschedulablePods)
 
 	computeCaches := func(nodeGroupId string) {
 		nodeInfo, found := nodeInfos[nodeGroupId]
@@ -570,7 +583,7 @@ func getPodsPredicatePassingCheckFunctions(
 
 		podsPassing := make([]*apiv1.Pod, 0)
 		podsNotPassing := make(map[*apiv1.Pod]status.Reasons)
-		schedulableOnNode := checkPodsSchedulableOnNode(context, unschedulablePods, nodeGroupId, nodeInfo)
+		schedulableOnNode := checker.checkPodsSchedulableOnNode(nodeGroupId, nodeInfo)
 		for pod, err := range schedulableOnNode {
 			if err == nil {
 				podsPassing = append(podsPassing, pod)
@@ -704,13 +717,14 @@ func executeScaleUp(context *context.AutoscalingContext, clusterStateRegistry *c
 }
 
 func applyScaleUpResourcesLimits(
+	cp cloudprovider.CloudProvider,
 	newNodes int,
 	scaleUpResourcesLeft scaleUpResourcesLimits,
 	nodeInfo *schedulernodeinfo.NodeInfo,
 	nodeGroup cloudprovider.NodeGroup,
 	resourceLimiter *cloudprovider.ResourceLimiter) (int, errors.AutoscalerError) {
 
-	delta, err := computeScaleUpResourcesDelta(nodeInfo, nodeGroup, resourceLimiter)
+	delta, err := computeScaleUpResourcesDelta(cp, nodeInfo, nodeGroup, resourceLimiter)
 	if err != nil {
 		return 0, err
 	}

@@ -20,12 +20,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/limitrange"
 	"net/http"
 
 	"strings"
 
 	"k8s.io/api/admission/v1beta1"
 	"k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1beta2"
 	metrics_admission "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/metrics/admission"
@@ -37,11 +39,13 @@ import (
 type AdmissionServer struct {
 	recommendationProvider RecommendationProvider
 	podPreProcessor        PodPreProcessor
+	vpaPreProcessor        VpaPreProcessor
+	limitsChecker          limitrange.LimitRangeCalculator
 }
 
 // NewAdmissionServer constructs new AdmissionServer
-func NewAdmissionServer(recommendationProvider RecommendationProvider, podPreProcessor PodPreProcessor) *AdmissionServer {
-	return &AdmissionServer{recommendationProvider, podPreProcessor}
+func NewAdmissionServer(recommendationProvider RecommendationProvider, podPreProcessor PodPreProcessor, vpaPreProcessor VpaPreProcessor, limitsChecker limitrange.LimitRangeCalculator) *AdmissionServer {
+	return &AdmissionServer{recommendationProvider, podPreProcessor, vpaPreProcessor, limitsChecker}
 }
 
 type patchRecord struct {
@@ -71,45 +75,16 @@ func (s *AdmissionServer) getPatchesForPodResourceRequest(raw []byte, namespace 
 	if annotationsPerContainer == nil {
 		annotationsPerContainer = vpa_api_util.ContainerToAnnotationsMap{}
 	}
+
 	patches := []patchRecord{}
 	updatesAnnotation := []string{}
 	for i, containerResources := range containersResources {
-
-		// Add resources empty object if missing
-		if pod.Spec.Containers[i].Resources.Limits == nil &&
-			pod.Spec.Containers[i].Resources.Requests == nil {
-			patches = append(patches, patchRecord{
-				Op:    "add",
-				Path:  fmt.Sprintf("/spec/containers/%d/resources", i),
-				Value: v1.ResourceRequirements{},
-			})
-		}
-
-		// Add request empty map if missing
-		if pod.Spec.Containers[i].Resources.Requests == nil {
-			patches = append(patches, patchRecord{
-				Op:    "add",
-				Path:  fmt.Sprintf("/spec/containers/%d/resources/requests", i),
-				Value: v1.ResourceList{}})
-		}
-
-		annotations, found := annotationsPerContainer[pod.Spec.Containers[i].Name]
-		if !found {
-			annotations = make([]string, 0)
-		}
-		for resource, request := range containerResources.Requests {
-			// Set request
-			patches = append(patches, patchRecord{
-				Op:    "add",
-				Path:  fmt.Sprintf("/spec/containers/%d/resources/requests/%s", i, resource),
-				Value: request.String()})
-			annotations = append(annotations, fmt.Sprintf("%s request", resource))
-		}
-
-		updatesAnnotation = append(updatesAnnotation, fmt.Sprintf("container %d: ", i)+strings.Join(annotations, ", "))
+		newPatches, newUpdatesAnnotation := s.getContainerPatch(pod, i, annotationsPerContainer, containerResources)
+		patches = append(patches, newPatches...)
+		updatesAnnotation = append(updatesAnnotation, newUpdatesAnnotation)
 	}
 	if len(updatesAnnotation) > 0 {
-		vpaAnnotationValue := fmt.Sprintf("Pod resources updated by %s: ", vpaName) + strings.Join(updatesAnnotation, "; ")
+		vpaAnnotationValue := fmt.Sprintf("Pod resources updated by %s: %s", vpaName, strings.Join(updatesAnnotation, "; "))
 		if pod.Annotations == nil {
 			patches = append(patches, patchRecord{
 				Op:    "add",
@@ -123,6 +98,61 @@ func (s *AdmissionServer) getPatchesForPodResourceRequest(raw []byte, namespace 
 		}
 	}
 	return patches, nil
+}
+
+func getPatchInitializingEmptyResources(i int) patchRecord {
+	return patchRecord{
+		Op:    "add",
+		Path:  fmt.Sprintf("/spec/containers/%d/resources", i),
+		Value: v1.ResourceRequirements{},
+	}
+}
+
+func getPatchInitializingEmptyResourcesSubfield(i int, kind string) patchRecord {
+	return patchRecord{
+		Op:    "add",
+		Path:  fmt.Sprintf("/spec/containers/%d/resources/%s", i, kind),
+		Value: v1.ResourceList{},
+	}
+}
+
+func getAddResourceRequirementValuePatch(i int, kind string, resource v1.ResourceName, quantity resource.Quantity) patchRecord {
+	return patchRecord{
+		Op:    "add",
+		Path:  fmt.Sprintf("/spec/containers/%d/resources/%s/%s", i, kind, resource),
+		Value: quantity.String()}
+}
+
+func (s *AdmissionServer) getContainerPatch(pod v1.Pod, i int, annotationsPerContainer vpa_api_util.ContainerToAnnotationsMap, containerResources vpa_api_util.ContainerResources) ([]patchRecord, string) {
+	var patches []patchRecord
+	// Add empty resources object if missing
+	if pod.Spec.Containers[i].Resources.Limits == nil &&
+		pod.Spec.Containers[i].Resources.Requests == nil {
+		patches = append(patches, getPatchInitializingEmptyResources(i))
+	}
+
+	annotations, found := annotationsPerContainer[pod.Spec.Containers[i].Name]
+	if !found {
+		annotations = make([]string, 0)
+	}
+
+	patches, annotations = appendPatchesAndAnnotations(patches, annotations, pod.Spec.Containers[i].Resources.Requests, i, containerResources.Requests, "requests", "request")
+	patches, annotations = appendPatchesAndAnnotations(patches, annotations, pod.Spec.Containers[i].Resources.Limits, i, containerResources.Limits, "limits", "limit")
+
+	updatesAnnotation := fmt.Sprintf("container %d: ", i) + strings.Join(annotations, ", ")
+	return patches, updatesAnnotation
+}
+
+func appendPatchesAndAnnotations(patches []patchRecord, annotations []string, current v1.ResourceList, containerIndex int, resources v1.ResourceList, fieldName, resourceName string) ([]patchRecord, []string) {
+	// Add empty object if it's missing and we're about to fill it.
+	if current == nil && len(resources) > 0 {
+		patches = append(patches, getPatchInitializingEmptyResourcesSubfield(containerIndex, fieldName))
+	}
+	for resource, request := range resources {
+		patches = append(patches, getAddResourceRequirementValuePatch(containerIndex, fieldName, resource, request))
+		annotations = append(annotations, fmt.Sprintf("%s %s", resource, resourceName))
+	}
+	return patches, annotations
 }
 
 func parseVPA(raw []byte) (*vpa_types.VerticalPodAutoscaler, error) {
@@ -185,8 +215,13 @@ func validateVPA(vpa *vpa_types.VerticalPodAutoscaler, isCreate bool) error {
 	return nil
 }
 
-func getPatchesForVPADefaults(raw []byte, isCreate bool) ([]patchRecord, error) {
+func (s *AdmissionServer) getPatchesForVPADefaults(raw []byte, isCreate bool) ([]patchRecord, error) {
 	vpa, err := parseVPA(raw)
+	if err != nil {
+		return nil, err
+	}
+
+	vpa, err = s.vpaPreProcessor.Process(vpa, isCreate)
 	if err != nil {
 		return nil, err
 	}
@@ -222,7 +257,7 @@ func (s *AdmissionServer) admit(data []byte) (*v1beta1.AdmissionResponse, metric
 	// The externalAdmissionHookConfiguration registered via selfRegistration
 	// asks the kube-apiserver only to send admission requests regarding pods & VPA objects.
 	podResource := metav1.GroupVersionResource{Group: "", Version: "v1", Resource: "pods"}
-	vpaResource := metav1.GroupVersionResource{Group: "autoscaling.k8s.io", Version: "v1beta1", Resource: "verticalpodautoscalers"}
+	vpaResource := metav1.GroupVersionResource{Group: "autoscaling.k8s.io", Version: "v1beta2", Resource: "verticalpodautoscalers"}
 	var patches []patchRecord
 	var err error
 	resource := metrics_admission.Unknown
@@ -232,7 +267,7 @@ func (s *AdmissionServer) admit(data []byte) (*v1beta1.AdmissionResponse, metric
 		patches, err = s.getPatchesForPodResourceRequest(ar.Request.Object.Raw, ar.Request.Namespace)
 		resource = metrics_admission.Pod
 	case vpaResource:
-		patches, err = getPatchesForVPADefaults(ar.Request.Object.Raw, ar.Request.Operation == v1beta1.Create)
+		patches, err = s.getPatchesForVPADefaults(ar.Request.Object.Raw, ar.Request.Operation == v1beta1.Create)
 		resource = metrics_admission.Vpa
 		// we don't let in problematic VPA objects - late validation
 		if err != nil {

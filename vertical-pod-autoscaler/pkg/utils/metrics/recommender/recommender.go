@@ -48,7 +48,7 @@ var (
 			Namespace: metricsNamespace,
 			Name:      "vpa_objects_count",
 			Help:      "Number of VPA objects present in the cluster.",
-		}, []string{"update_mode", "has_recommendation", "api"},
+		}, []string{"update_mode", "has_recommendation", "api", "matches_pods", "unsupported_config"},
 	)
 
 	recommendationLatency = prometheus.NewHistogram(
@@ -62,12 +62,22 @@ var (
 
 	functionLatency = metrics.CreateExecutionTimeMetric(metricsNamespace,
 		"Time spent in various parts of VPA Recommender main loop.")
+
+	aggregateContainerStatesCount = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Name:      "aggregate_container_states_count",
+			Help:      "Number of aggregate container states being tracked by the recommender",
+		},
+	)
 )
 
 type objectCounterKey struct {
-	mode       string
-	has        bool
-	apiVersion apiVersion
+	mode              string
+	has               bool
+	matchesPods       bool
+	apiVersion        apiVersion
+	unsupportedConfig bool
 }
 
 // ObjectCounter helps split all VPA objects into buckets
@@ -77,9 +87,7 @@ type ObjectCounter struct {
 
 // Register initializes all metrics for VPA Recommender
 func Register() {
-	prometheus.MustRegister(vpaObjectCount)
-	prometheus.MustRegister(recommendationLatency)
-	prometheus.MustRegister(functionLatency)
+	prometheus.MustRegister(vpaObjectCount, recommendationLatency, functionLatency, aggregateContainerStatesCount)
 }
 
 // NewExecutionTimer provides a timer for Recommender's RunOnce execution
@@ -92,6 +100,11 @@ func ObserveRecommendationLatency(created time.Time) {
 	recommendationLatency.Observe(time.Now().Sub(created).Seconds())
 }
 
+// RecordAggregateContainerStatesCount records the number of containers being tracked by the recommender
+func RecordAggregateContainerStatesCount(statesCount int) {
+	aggregateContainerStatesCount.Set(float64(statesCount))
+}
+
 // NewObjectCounter creates a new helper to split VPA objects into buckets
 func NewObjectCounter() *ObjectCounter {
 	obj := ObjectCounter{
@@ -102,7 +115,17 @@ func NewObjectCounter() *ObjectCounter {
 	for _, m := range modes {
 		for _, h := range []bool{false, true} {
 			for _, api := range []apiVersion{v1beta1, v1beta2} {
-				obj.cnt[objectCounterKey{mode: m, has: h, apiVersion: api}] = 0
+				for _, mp := range []bool{false, true} {
+					for _, uc := range []bool{false, true} {
+						obj.cnt[objectCounterKey{
+							mode:              m,
+							has:               h,
+							apiVersion:        api,
+							matchesPods:       mp,
+							unsupportedConfig: uc,
+						}] = 0
+					}
+				}
 			}
 		}
 	}
@@ -120,10 +143,13 @@ func (oc *ObjectCounter) Add(vpa *model.Vpa) {
 	if vpa.IsV1Beta1API {
 		api = v1beta1
 	}
+
 	key := objectCounterKey{
-		mode:       mode,
-		has:        vpa.HasRecommendation(),
-		apiVersion: api,
+		mode:              mode,
+		has:               vpa.HasRecommendation(),
+		apiVersion:        api,
+		matchesPods:       vpa.HasMatchedPods(),
+		unsupportedConfig: vpa.Conditions.ConditionActive(vpa_types.ConfigUnsupported),
 	}
 	oc.cnt[key]++
 }
@@ -131,6 +157,12 @@ func (oc *ObjectCounter) Add(vpa *model.Vpa) {
 // Observe passes all the computed bucket values to metrics
 func (oc *ObjectCounter) Observe() {
 	for k, v := range oc.cnt {
-		vpaObjectCount.WithLabelValues(k.mode, fmt.Sprintf("%v", k.has), string(k.apiVersion)).Set(float64(v))
+		vpaObjectCount.WithLabelValues(
+			k.mode,
+			fmt.Sprintf("%v", k.has),
+			string(k.apiVersion),
+			fmt.Sprintf("%v", k.matchesPods),
+			fmt.Sprintf("%v", k.unsupportedConfig),
+		).Set(float64(v))
 	}
 }

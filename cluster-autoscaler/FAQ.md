@@ -41,6 +41,7 @@ this document:
   * [How fast is HPA when combined with CA?](#how-fast-is-hpa-when-combined-with-ca)
   * [Where can I find the designs of the upcoming features?](#where-can-i-find-the-designs-of-the-upcoming-features)
   * [What are Expanders?](#what-are-expanders)
+  * [Does CA respect node affinity when selecting node groups to scale up?](#does-ca-respect-node-affinity-when-selecting-node-groups-to-scale-up)
   * [What are the parameters to CA?](#what-are-the-parameters-to-ca)
 * [Troubleshooting](#troubleshooting)
   * [I have a couple of nodes with low utilization, but they are not scaled down. Why?](#i-have-a-couple-of-nodes-with-low-utilization-but-they-are-not-scaled-down-why)
@@ -110,7 +111,7 @@ Since version 1.0.0 we consider CA as GA. It means that:
  * Most of the pain-points reported by the users (like too short graceful termination support) were fixed, however
    some of the less critical feature requests are yet to be implemented.
  * CA has decent monitoring, logging and eventing.
- * CA tries to handle most of the error situations in the cluster (like cloud provider stockouts, broken nodes, etc).
+ * CA tries to handle most of the error situations in the cluster (like cloud provider stockouts, broken nodes, etc). The cases handled can however vary from cloudprovider to cloudprovider.
  * CA developers are committed to maintaining and supporting CA in the foreseeable future.
 
 All of the previous versions (earlier that 1.0.0) are considered beta.
@@ -414,7 +415,7 @@ spec:
         - image: k8s.gcr.io/cluster-proportional-autoscaler-amd64:1.1.2
           name: autoscaler
           command:
-            - /cluster-proportional-autoscaler
+            - ./cluster-proportional-autoscaler
             - --namespace=default
             - --configmap=overprovisioning-autoscaler
             - --default-params={"linear":{"coresPerReplica":1}}
@@ -589,7 +590,7 @@ new nodes will be added.
 Expanders can be selected by passing the name to the `--expander` flag, i.e.
 `./cluster-autoscaler --expander=random`.
 
-Currently Cluster Autoscaler has 4 expanders:
+Currently Cluster Autoscaler has 5 expanders:
 
 * `random` - this is the default expander, and should be used when you don't have a particular
 need for the node groups to scale differently.
@@ -606,7 +607,15 @@ after scale-up. This is useful when you have different classes of nodes, for exa
 would match the cluster size. This expander is described in more details
 [HERE](https://github.com/kubernetes/autoscaler/blob/master/cluster-autoscaler/proposals/pricing.md). Currently it works only for GCE and GKE (patches welcome.)
 
-************
+* `priority` - selects the node group that has the highest priority assigned by the user. It's configuration is described in more details [here](expander/priority/readme.md)
+
+### Does CA respect node affinity when selecting node groups to scale up?
+
+CA respects `nodeSelector` and `requiredDuringSchedulingIgnoredDuringExecution` in nodeAffinity given that you have labelled your node groups accordingly. If there is a pod that cannot be scheduled with either `nodeSelector` or `requiredDuringSchedulingIgnoredDuringExecution` specified, CA will only consider node groups that satisfy those requirements for expansion.
+
+However, CA does not consider "soft" constraints like `preferredDuringSchedulingIgnoredDuringExecution` when selecting node groups. That means that if CA has two or more node groups available for expansion, it will not use soft constraints to pick one node group over another.
+
+****************
 
 ### What are the parameters to CA?
 
@@ -814,6 +823,9 @@ Events:
   ---------	--------	-----	----			-------------	--------	------			-------
   1m		1m		1	cluster-autoscaler			Normal		TriggeredScaleUp	pod triggered scale-up, group: https://content.googleapis.com/compute/v1/projects/maciekpytel-dev-playground/zones/us-central1-b/instanceGroups/e2e-test-maciekpytel-minion-group, sizes (current/new): 3/4
 ```
+### My cluster is below minimum / above maximum number of nodes, but CA did not fix that! Why?
+
+Cluster Autoscaler will not scale the cluster beyond these limits, but does not enforce them. If your cluster is below the minimum number of nodes configured for Cluster Autoscaler, it will be scaled up *only* in presence of unschedulable pods.
 
 ### What happens in scale-up when I have no more quota in the cloud provider?
 
@@ -888,26 +900,4 @@ We are aware that this process is tedious and we will work to improve it.
 
 ### How can I update CA dependencies (particularly k8s.io/kubernetes)?
 
-CA depends on `k8s.io/kubernetes` internals as well as the k8s.io libs like
-`k8s.io/apimachinery`. However `k8s.io/kubernetes` has its own/newer version of these libraries
-(in a `staging` directory) which may not always be compatible with what has been published to apimachinery repo.
-This leads to various conflicts that are hard to resolve in a "proper" way. So until a better solution
-is proposed (or we stop migrating stuff between `k8s.io/kubernetes` and other projects on a daily basis),
-the following hack makes the things easier to handle:
-
-1. Create a new `$GOPATH` directory.
-2. Get `k8s.io/kubernetes` and `k8s.io/autoscaler` source code (via `git clone` or `go get`).
-3. Make sure that you use the correct branch/tag in `k8s.io/kubernetes`(Note: please refer cluster-autoscaler/kubernetes.sync for the last sync commit). For example, regular dev updates should be done against `k8s.io/kubernetes` HEAD, while updates in CA release branches should be done
-   against the latest release tag of the corresponding `k8s.io/kubernetes` branch.
-4. Do `godep restore` in `k8s.io/kubernetes`.
-5. Remove Godeps and vendor from `k8s.io/autoscaler/cluster-autoscaler`.
-6. Add some other dependencies to `_override` if needed, and update `fix_gopath.sh` to use them. Make sure that the code in `k8s.io/autoscaler/cluster-autoscaler` refers to them somehow (may be a blank import).
-7. Invoke `fix_gopath.sh`. This will update `k8s.io/api`, `k8s.io/apimachinery` etc with the content of
-   `k8s.io/kubernetes/staging` and remove all vendor directories from your gopath.
-8. Check if everything compiles with `go test ./...` in `k8s.io/autoscaler/cluster-autoscaler`.
-9. `godep save ./...` in `k8s.io/autoscaler/cluster-autoscaler`,
-10. Update `kubernetes.sync` with the commit used to perform this update (output
-    of running `git show --summary HEAD^` in `k8s.io/kubernetes`.). We use `HEAD^` because we want to skip extra "no_vendor" 
-    commit generated by `fix_gopath.sh`.
-11. Send a PR with 2 commits - one that covers `Godep` and `vendor/`, and the other one with all
-   required real code changes.
+TODO - update needed after k8s migrated to go modules

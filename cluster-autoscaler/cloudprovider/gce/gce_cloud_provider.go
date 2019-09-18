@@ -34,6 +34,19 @@ import (
 const (
 	// ProviderNameGCE is the name of GCE cloud provider.
 	ProviderNameGCE = "gce"
+
+	// GPULabel is the label added to nodes with GPU resource.
+	GPULabel = "cloud.google.com/gke-accelerator"
+)
+
+var (
+	availableGPUTypes = map[string]struct{}{
+		"nvidia-tesla-k80":  {},
+		"nvidia-tesla-p100": {},
+		"nvidia-tesla-v100": {},
+		"nvidia-tesla-p4":   {},
+		"nvidia-tesla-t4":   {},
+	}
 )
 
 // GceCloudProvider implements CloudProvider interface.
@@ -59,12 +72,22 @@ func (gce *GceCloudProvider) Name() string {
 	return ProviderNameGCE
 }
 
+// GPULabel returns the label added to nodes with GPU resource.
+func (gce *GceCloudProvider) GPULabel() string {
+	return GPULabel
+}
+
+// GetAvailableGPUTypes return all available GPU types cloud provider supports
+func (gce *GceCloudProvider) GetAvailableGPUTypes() map[string]struct{} {
+	return availableGPUTypes
+}
+
 // NodeGroups returns all node groups configured for this cloud provider.
 func (gce *GceCloudProvider) NodeGroups() []cloudprovider.NodeGroup {
 	migs := gce.gceManager.GetMigs()
 	result := make([]cloudprovider.NodeGroup, 0, len(migs))
 	for _, mig := range migs {
-		result = append(result, mig.Config)
+		result = append(result, mig)
 	}
 	return result
 }
@@ -134,12 +157,12 @@ func (ref GceRef) ToProviderId() string {
 // from provider id which must be in format:
 // gce://<project-id>/<zone>/<name>
 // TODO(piosz): add better check whether the id is correct
-func GceRefFromProviderId(id string) (*GceRef, error) {
+func GceRefFromProviderId(id string) (GceRef, error) {
 	splitted := strings.Split(id[6:], "/")
 	if len(splitted) != 3 {
-		return nil, fmt.Errorf("wrong id: expected format gce://<project-id>/<zone>/<name>, got %v", id)
+		return GceRef{}, fmt.Errorf("wrong id: expected format gce://<project-id>/<zone>/<name>, got %v", id)
 	}
-	return &GceRef{
+	return GceRef{
 		Project: splitted[0],
 		Zone:    splitted[1],
 		Name:    splitted[2],
@@ -248,7 +271,7 @@ func (mig *gceMig) DeleteNodes(nodes []*apiv1.Node) error {
 	if int(size) <= mig.MinSize() {
 		return fmt.Errorf("min size reached, nodes will not be deleted")
 	}
-	refs := make([]*GceRef, 0, len(nodes))
+	refs := make([]GceRef, 0, len(nodes))
 	for _, node := range nodes {
 
 		belongs, err := mig.Belongs(node)
