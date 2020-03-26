@@ -20,6 +20,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/klog"
 	"k8s.io/utils/pointer"
 )
 
@@ -67,6 +68,14 @@ func newMachineSetFromUnstructured(u *unstructured.Unstructured) *MachineSet {
 		},
 		Spec:   MachineSetSpec{},
 		Status: MachineSetStatus{},
+	}
+
+	machineSpec, found, err := unstructured.NestedMap(u.Object, "spec", "template", "spec")
+	if err == nil && found {
+		machineSpecUnstructured := unstructured.Unstructured{Object: machineSpec}
+		klog.Infof("Good spec.tamplate.spec labels %+v", machineSpecUnstructured.GetLabels())
+		machineSet.Spec.Template.Spec.Labels = machineSpecUnstructured.GetLabels()
+		// TODO: same for taints.
 	}
 
 	replicas, found, err := unstructured.NestedInt64(u.Object, "spec", "replicas")
