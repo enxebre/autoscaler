@@ -21,6 +21,8 @@ import (
 	"strconv"
 	"strings"
 
+	"k8s.io/autoscaler/cluster-autoscaler/utils/units"
+
 	"github.com/pkg/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -30,10 +32,11 @@ const (
 	nodeGroupMinSizeAnnotationKey = "machine.openshift.io/cluster-api-autoscaler-node-group-min-size"
 	nodeGroupMaxSizeAnnotationKey = "machine.openshift.io/cluster-api-autoscaler-node-group-max-size"
 
-	cpuKey     = "machine.openshift.io/vCPU"
-	memoryKey  = "machine.openshift.io/memoryMb"
-	gpuKey     = "machine.openshift.io/GPU"
-	maxPodsKey = "machine.openshift.io/maxPods"
+	cpuKey              = "machine.openshift.io/vCPU"
+	memoryKeyDeprecated = "machine.openshift.io/memoryMb"
+	memoryKey           = "machine.openshift.io/memory"
+	gpuKey              = "machine.openshift.io/GPU"
+	maxPodsKey          = "machine.openshift.io/maxPods"
 )
 
 var (
@@ -165,7 +168,12 @@ func normalizedProviderString(s string) normalizedProviderID {
 
 func scaleFromZeroEnabled(annotations map[string]string) bool {
 	cpu := annotations[cpuKey]
-	mem := annotations[memoryKey]
+
+	mem, ok := annotations[memoryKey]
+	if !ok {
+		// TODO(alberto): drop this fallback after removing the deprecated key from aws/azure/gcp controllers
+		mem = annotations[memoryKeyDeprecated]
+	}
 
 	if cpu != "" && mem != "" {
 		return true
@@ -185,16 +193,16 @@ func parseCPUCapacity(annotations map[string]string) (resource.Quantity, error) 
 }
 
 func parseMemoryCapacity(annotations map[string]string) (resource.Quantity, error) {
-	// the value for the memoryKey is expected to have the unit type included,
-	// eg "1024Mi". if only a number is present, we add the suffix "Mi".
+	// The value for the memoryKey is expected to be an integer representing Mebibytes,
+	// eg "1024".
 	val, exists := annotations[memoryKey]
 	if exists && val != "" {
-		// TODO remove this check once we ensured that the providers are using the correct values
-		if _, err := strconv.Atoi(val); err == nil {
-			// value is a number, we will append "Mi" as the unit type
-			val = fmt.Sprintf("%sMi", val)
+		valMb, err := strconv.ParseInt(val, 10, 0)
+		if err != nil {
+			return zeroQuantity.DeepCopy(), fmt.Errorf("value %s from annotation %s expected to be an integer: %v", val, memoryKey, err)
 		}
-		return resource.ParseQuantity(val)
+		// Convert from Mebibytes to bytes
+		return *resource.NewQuantity(valMb*units.MiB, resource.DecimalSI), nil
 	}
 	return zeroQuantity.DeepCopy(), nil
 }
